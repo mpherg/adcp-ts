@@ -116,3 +116,39 @@ interface WarningStatus {
     code?: string;
 }
 ```
+
+## Error Handling
+
+The client detects and handles connection issues gracefully:
+
+- **Socket errors:** logged via the optional logger, `connected` flag set to false
+- **Timeouts:** `readLine()` has a 5-second timeout; if no response arrives, the promise rejects
+- **Disconnects:** if the socket closes during a request, the error is caught and propagated
+- **Stale connections:** calling `send()` on a disconnected client throws `"Not connected. Call connect() first or connection was lost."`
+
+### Example with Error Recovery
+
+```typescript
+const client = new ADCPClient(host, port, password, logger);
+
+try {
+    await client.connect();
+    // ... use client
+} catch (err) {
+    console.error('Connection failed:', err.message);
+    // Could retry here with exponential backoff
+}
+```
+
+If the connection drops mid-operation:
+
+```typescript
+try {
+    await client.getPowerStatus();
+} catch (err) {
+    if (err.message.includes('Not connected')) {
+        console.error('Lost connection, need to reconnect');
+        await client.connect();
+    }
+}
+```

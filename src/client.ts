@@ -25,6 +25,18 @@ export class ADCPClient {
         }
     }
 
+    private setupSocketHandlers(): void {
+        this.socket.on('error', (err) => {
+            this.dbg('[ADCP][client] socket error event', err);
+            this.connected = false;
+        });
+
+        this.socket.on('close', () => {
+            this.dbg('[ADCP][client] socket closed');
+            this.connected = false;
+        });
+    }
+
     async connect(): Promise<void> {
         this.dbg('[ADCP][client] connect ->', { host: this.host, port: this.port });
         this.socket = net.createConnection(this.port, this.host);
@@ -32,10 +44,11 @@ export class ADCPClient {
         await new Promise<void>((resolve, reject) => {
             this.socket.once('connect', () => {
                 this.dbg('[ADCP][client] socket connected');
+                this.setupSocketHandlers();
                 resolve();
             });
             this.socket.once('error', (err) => {
-                this.dbg('[ADCP][client] socket error', err);
+                this.dbg('[ADCP][client] socket error during connect', err);
                 reject(err);
             });
         });
@@ -63,20 +76,36 @@ export class ADCPClient {
     // ------------------- Internal Methods ------------------- //
 
     private async send(cmd: string): Promise<any> {
-        if (!this.connected) throw new Error('Not connected');
+        if (!this.connected) {
+            throw new Error('Not connected. Call connect() first or connection was lost.');
+        }
 
-        const out = formatCommand(cmd, this.logger);
-        this.dbg('[ADCP][client] send ->', { cmd, out });
-        this.socket.write(out);
-        const response = await this.readLine();
-        this.dbg('[ADCP][client] send <- raw response', response);
-        const parsed = parseResponse(response, this.logger);
-        this.dbg('[ADCP][client] send <- parsed response', parsed);
-        return parsed;
+        try {
+            const out = formatCommand(cmd, this.logger);
+            this.dbg('[ADCP][client] send ->', { cmd, out });
+            this.socket.write(out);
+            const response = await this.readLine();
+            this.dbg('[ADCP][client] send <- raw response', response);
+            const parsed = parseResponse(response, this.logger);
+            this.dbg('[ADCP][client] send <- parsed response', parsed);
+            return parsed;
+        } catch (err) {
+            this.connected = false;
+            this.dbg('[ADCP][client] send error, marking disconnected', err);
+            throw err;
+        }
     }
 
-    private async readLine(): Promise<string> {
-        return new Promise<string>((resolve) => {
+    private async readLine(timeoutMs: number = 5000): Promise<string> {
+        return new Promise<string>((resolve, reject) => {
+            let timeoutId: NodeJS.Timeout | null = null;
+
+            const cleanup = () => {
+                if (timeoutId) clearTimeout(timeoutId);
+                this.socket.off('data', handler);
+                this.socket.off('close', closeHandler);
+            };
+
             const handler = (data: Buffer) => {
                 this.dbg('[ADCP][client] readLine got chunk', data.toString('ascii'));
                 this.buffer += data.toString('ascii');
@@ -84,12 +113,24 @@ export class ADCPClient {
                 if (index !== -1) {
                     const line = this.buffer.slice(0, index);
                     this.buffer = this.buffer.slice(index + 2);
-                    this.socket.off('data', handler);
+                    cleanup();
                     this.dbg('[ADCP][client] readLine ->', line);
                     resolve(line);
                 }
             };
+
+            const closeHandler = () => {
+                cleanup();
+                reject(new Error('Socket closed while waiting for response'));
+            };
+
+            timeoutId = setTimeout(() => {
+                cleanup();
+                reject(new Error(`readLine timeout after ${timeoutMs}ms`));
+            }, timeoutMs);
+
             this.socket.on('data', handler);
+            this.socket.once('close', closeHandler);
         });
     }
 
