@@ -1,38 +1,61 @@
 import net from 'net';
 import { formatCommand, parseResponse } from './protocol';
 import { authenticate } from './auth';
-import { PowerState, PowerStatus, ErrorStatus, WarningStatus } from './types';
+import { PowerState, PowerStatus, ErrorStatus, WarningStatus, Logger } from './types';
 
 export class ADCPClient {
     private socket!: net.Socket;
     private buffer = '';
     private connected = false;
 
+    private logger?: Logger;
+
     constructor(
         private host: string,
         private port: number = 53595,
-        private password?: string
-    ) {}
+        private password?: string,
+        logger?: Logger
+    ) {
+        this.logger = logger;
+    }
+
+    private dbg(...args: any[]) {
+        if (this.logger?.debug) {
+            this.logger.debug(...args);
+        }
+    }
 
     async connect(): Promise<void> {
+        this.dbg('[ADCP][client] connect ->', { host: this.host, port: this.port });
         this.socket = net.createConnection(this.port, this.host);
 
         await new Promise<void>((resolve, reject) => {
-            this.socket.once('connect', resolve);
-            this.socket.once('error', reject);
+            this.socket.once('connect', () => {
+                this.dbg('[ADCP][client] socket connected');
+                resolve();
+            });
+            this.socket.once('error', (err) => {
+                this.dbg('[ADCP][client] socket error', err);
+                reject(err);
+            });
         });
 
         const challenge = await this.readLine();
+        this.dbg('[ADCP][client] server challenge:', challenge);
 
         if (challenge !== 'NOKEY' && this.password) {
-            const ok = await authenticate(this.socket, challenge, this.password);
+            this.dbg('[ADCP][client] attempting authenticate');
+            const ok = await authenticate(this.socket, challenge, this.password, this.logger);
+            this.dbg('[ADCP][client] authenticate ok=', ok);
             if (!ok) throw new Error('Authentication failed');
         }
 
         this.connected = true;
+        this.dbg('[ADCP][client] connected=true');
     }
 
     close() {
+        this.dbg('[ADCP][client] close called');
         this.socket?.end();
         this.connected = false;
     }
@@ -42,20 +65,27 @@ export class ADCPClient {
     private async send(cmd: string): Promise<any> {
         if (!this.connected) throw new Error('Not connected');
 
-        this.socket.write(formatCommand(cmd));
+        const out = formatCommand(cmd, this.logger);
+        this.dbg('[ADCP][client] send ->', { cmd, out });
+        this.socket.write(out);
         const response = await this.readLine();
-        return parseResponse(response);
+        this.dbg('[ADCP][client] send <- raw response', response);
+        const parsed = parseResponse(response, this.logger);
+        this.dbg('[ADCP][client] send <- parsed response', parsed);
+        return parsed;
     }
 
     private async readLine(): Promise<string> {
         return new Promise<string>((resolve) => {
             const handler = (data: Buffer) => {
+                this.dbg('[ADCP][client] readLine got chunk', data.toString('ascii'));
                 this.buffer += data.toString('ascii');
                 const index = this.buffer.indexOf('\r\n');
                 if (index !== -1) {
                     const line = this.buffer.slice(0, index);
                     this.buffer = this.buffer.slice(index + 2);
                     this.socket.off('data', handler);
+                    this.dbg('[ADCP][client] readLine ->', line);
                     resolve(line);
                 }
             };
@@ -66,13 +96,18 @@ export class ADCPClient {
     // ------------------- Public API Methods ------------------- //
 
     async setPower(state: PowerState): Promise<true> {
+        this.dbg('[ADCP][client] setPower ->', state);
         await this.send(`power "${state}"`);
+        this.dbg('[ADCP][client] setPower done');
         return true;
     }
 
     async getPowerStatus(): Promise<PowerStatus> {
+        this.dbg('[ADCP][client] getPowerStatus');
         const r = await this.send(`power_status ?`);
-        return { state: r?.status ?? r };
+        const state = r?.status ?? r;
+        this.dbg('[ADCP][client] getPowerStatus <-', state);
+        return { state };
     }
 
     async getErrors(): Promise<ErrorStatus> {
@@ -92,10 +127,16 @@ export class ADCPClient {
     }
 
     async getModelName(): Promise<string> {
-        return String(await this.send(`modelname ?`));
+        this.dbg('[ADCP][client] getModelName');
+        const r = await this.send(`modelname ?`);
+        this.dbg('[ADCP][client] getModelName <-', r);
+        return String(r);
     }
 
     async getSerialNumber(): Promise<string> {
-        return String(await this.send(`serialnum ?`));
+        this.dbg('[ADCP][client] getSerialNumber');
+        const r = await this.send(`serialnum ?`);
+        this.dbg('[ADCP][client] getSerialNumber <-', r);
+        return String(r);
     }
 }
